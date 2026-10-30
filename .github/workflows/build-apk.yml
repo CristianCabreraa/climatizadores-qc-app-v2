@@ -1,34 +1,55 @@
-name: Compilar APK Android para GreenAir QC
+name: Compilar GreenAir QC V2 - APK de prueba
 
 on:
-  push:
-    branches: [ main, master ]
   workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Descargar código fuente
+      - name: Descargar codigo del repositorio
         uses: actions/checkout@v4
 
-      - name: Configurar Java JDK 17
+      - name: Configurar Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
-          java-version: 17
+          distribution: temurin
+          java-version: '17'
 
-      - name: Configurar Gradle
-        uses: gradle/actions/setup-gradle@v3
+      - name: Fijar Gradle 8.2.1 (compatible con AGP 8.2.1)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.2.1'
 
-      - name: Compilar APK nativo con Gradle
+      - name: Sincronizar interfaz web V2 en la app Android
         run: |
-          cd android
-          gradle assembleDebug --stacktrace
+          mkdir -p android/app/src/main/assets/public
+          cp index.html manifest.json sw.js android/app/src/main/assets/public/
+          cp -R css js assets android/app/src/main/assets/public/
 
-      - name: Subir APK v1 generado como artefacto descargable
+      - name: Comprobar version de Gradle
+        run: gradle --version
+
+      - name: Compilar APK debug desde codigo fuente Android
+        working-directory: android
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Verificar que la APK existe y su ZIP es legible
+        run: |
+          APK="android/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          unzip -t "$APK" > /dev/null
+          ls -lh "$APK"
+
+      - name: Publicar APK para descarga
         uses: actions/upload-artifact@v4
         with:
-          name: GreenAir-QC-v1.apk
+          name: GreenAir-QC-V2-debug
           path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

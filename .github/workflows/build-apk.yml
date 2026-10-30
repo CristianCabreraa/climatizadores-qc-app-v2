@@ -1,72 +1,97 @@
-name: Compilar GreenAir QC V2 Android (debug)
-
+name: GreenAir QC V2.1 - Corregir, comprobar y compilar
 on:
-  push:
-    branches: [main, master]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
-      - name: Descargar repositorio
+      - name: Descargar el código existente
         uses: actions/checkout@v4
-
-      - name: Configurar Java 17
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Aplicar correcciones verificadas al código fuente
+        run: python3 aplicar_correcciones_autonomo.py .
+      - name: Validar JavaScript y código generado
+        run: |
+          set -euo pipefail
+          for file in js/*.js; do node --check "$file"; done
+          python3 - <<'PY'
+          from pathlib import Path
+          html=Path('index.html').read_text()
+          js=Path('js/app.js').read_text()
+          pdf=Path('js/pdf-generator.js').read_text()
+          android=Path('android/app/src/main/java/com/greenair/industrial/qc/MainActivity.java').read_text()
+          for token in ['orderInput','photoCameraInput','selectSondaCo2','btnClearForm']:
+              assert token in html, token
+          for token in ['resetMachineForm','updateCheckpointBadges','orderNumber','greenair:native-status']:
+              assert token in js, token
+          assert 'safeOrder' in pdf
+          for token in ['ACTION_IMAGE_CAPTURE','FileProvider','ACTION_SEND','ACTION_CREATE_DOCUMENT','WebViewAssetLoader']:
+              assert token in android, token
+          print('Verificaciones estáticas completadas')
+          PY
+      - name: Preparar Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-
-      - name: Configurar Gradle compatible con AGP 8.2.1
+      - name: Configurar Gradle 8.2.1 para AGP 8.2.1
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.2.1'
-
-      - name: Sincronizar V2 web con los assets del proyecto Android
-        shell: bash
+      - name: Copiar web V2.1 a los recursos de Android
         run: |
           set -euo pipefail
           target="android/app/src/main/assets/public"
           mkdir -p "$target"
-          cp index.html "$target/index.html"
-          cp manifest.json "$target/manifest.json"
-          cp sw.js "$target/sw.js"
-          cp -a js "$target/"
-          cp -a css "$target/"
-          cp -a assets "$target/"
-          test -s "$target/index.html"
-          test -s "$target/js/app.js"
-          cmp index.html "$target/index.html"
-          cmp js/app.js "$target/js/app.js"
-          grep -q 'btnMenuElectricidad' "$target/index.html"
-          grep -q 'WebViewAssetLoader' android/app/src/main/java/com/greenair/industrial/qc/MainActivity.java
-          echo 'Archivos web V2 sincronizados y WebViewAssetLoader presente.'
-
-      - name: Compilar APK Android debug
+          cp index.html manifest.json sw.js "$target/"
+          rm -rf "$target/js" "$target/css" "$target/assets"
+          cp -a js css assets "$target/"
+          cmp "$target/js/app.js" js/app.js
+          cmp "$target/index.html" index.html
+      - name: Compilar APK de prueba
         working-directory: android
-        run: |
-          gradle --version
-          gradle assembleDebug --stacktrace --no-daemon
-
-      - name: Validar APK y archivos incluidos
-        shell: bash
+        run: gradle assembleDebug --no-daemon --stacktrace
+      - name: Comprobar APK generada
         run: |
           set -euo pipefail
           apk="android/app/build/outputs/apk/debug/app-debug.apk"
           test -s "$apk"
           unzip -t "$apk" >/dev/null
-          unzip -p "$apk" assets/public/index.html | grep -q 'btnMenuElectricidad'
-          unzip -p "$apk" assets/public/js/app.js | grep -q 'class AppController'
-          echo "APK generada, ZIP válido y HTML/JS incluidos."
-          echo "Tamaño: $(du -h "$apk" | cut -f1)"
-
-      - name: Publicar APK como artefacto descargable
+          unzip -p "$apk" assets/public/index.html | grep -q 'orderInput'
+          unzip -p "$apk" assets/public/js/app.js | grep -q 'resetMachineForm'
+          echo 'APK ZIP válido, con recursos V2.1 incluidos.'
+      - name: Crear ZIP de código fuente completo corregido
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import zipfile
+          root=Path('.')
+          target=Path('GreenAir-QC-V2-1-CODIGO-COMPLETO.zip')
+          ignored_dirs={'.git','node_modules','.gradle','build','__backup_greenair_v2','.idea'}
+          exclude_names={'temp_base.apk','GreenAir-QC-v1.apk','GreenAir-QC-v2.apk','apk_sign.tgz','uber-apk-signer.jar'}
+          with zipfile.ZipFile(target,'w',zipfile.ZIP_DEFLATED) as z:
+              for p in sorted(root.rglob('*')):
+                  if not p.is_file() or target==p: continue
+                  if set(p.parts)&ignored_dirs or p.name in exclude_names or p.suffix=='.keystore': continue
+                  z.write(p,p.as_posix())
+          print(target, target.stat().st_size, 'bytes')
+          PY
+      - name: Publicar APK y proyecto completo (descargas separadas)
         uses: actions/upload-artifact@v4
         with:
-          name: GreenAir-QC-V2-debug
+          name: GreenAir-QC-V2-1-APK
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
-          retention-days: 14
+      - name: Publicar fuente corregida
+        uses: actions/upload-artifact@v4
+        with:
+          name: GreenAir-QC-V2-1-CODIGO-COMPLETO
+          path: GreenAir-QC-V2-1-CODIGO-COMPLETO.zip
+          if-no-files-found: error

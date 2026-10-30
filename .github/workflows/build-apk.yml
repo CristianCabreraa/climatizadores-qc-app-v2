@@ -1,19 +1,17 @@
-name: Compilar GreenAir QC V2 - APK de prueba
+name: Compilar GreenAir QC V2 Android (debug)
 
 on:
-  workflow_dispatch:
   push:
-    branches: [main]
-
-permissions:
-  contents: read
+    branches: [main, master]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: read
     steps:
-      - name: Descargar codigo del repositorio
+      - name: Descargar repositorio
         uses: actions/checkout@v4
 
       - name: Configurar Java 17
@@ -22,34 +20,53 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Fijar Gradle 8.2.1 (compatible con AGP 8.2.1)
-        uses: gradle/actions/setup-gradle@v4
+      - name: Configurar Gradle compatible con AGP 8.2.1
+        uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.2.1'
 
-      - name: Sincronizar interfaz web V2 en la app Android
+      - name: Sincronizar V2 web con los assets del proyecto Android
+        shell: bash
         run: |
-          mkdir -p android/app/src/main/assets/public
-          cp index.html manifest.json sw.js android/app/src/main/assets/public/
-          cp -R css js assets android/app/src/main/assets/public/
+          set -euo pipefail
+          target="android/app/src/main/assets/public"
+          mkdir -p "$target"
+          cp index.html "$target/index.html"
+          cp manifest.json "$target/manifest.json"
+          cp sw.js "$target/sw.js"
+          cp -a js "$target/"
+          cp -a css "$target/"
+          cp -a assets "$target/"
+          test -s "$target/index.html"
+          test -s "$target/js/app.js"
+          cmp index.html "$target/index.html"
+          cmp js/app.js "$target/js/app.js"
+          grep -q 'btnMenuElectricidad' "$target/index.html"
+          grep -q 'WebViewAssetLoader' android/app/src/main/java/com/greenair/industrial/qc/MainActivity.java
+          echo 'Archivos web V2 sincronizados y WebViewAssetLoader presente.'
 
-      - name: Comprobar version de Gradle
-        run: gradle --version
-
-      - name: Compilar APK debug desde codigo fuente Android
+      - name: Compilar APK Android debug
         working-directory: android
-        run: gradle assembleDebug --no-daemon --stacktrace
-
-      - name: Verificar que la APK existe y su ZIP es legible
         run: |
-          APK="android/app/build/outputs/apk/debug/app-debug.apk"
-          test -s "$APK"
-          unzip -t "$APK" > /dev/null
-          ls -lh "$APK"
+          gradle --version
+          gradle assembleDebug --stacktrace --no-daemon
 
-      - name: Publicar APK para descarga
+      - name: Validar APK y archivos incluidos
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="android/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$apk"
+          unzip -t "$apk" >/dev/null
+          unzip -p "$apk" assets/public/index.html | grep -q 'btnMenuElectricidad'
+          unzip -p "$apk" assets/public/js/app.js | grep -q 'class AppController'
+          echo "APK generada, ZIP válido y HTML/JS incluidos."
+          echo "Tamaño: $(du -h "$apk" | cut -f1)"
+
+      - name: Publicar APK como artefacto descargable
         uses: actions/upload-artifact@v4
         with:
           name: GreenAir-QC-V2-debug
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          retention-days: 14

@@ -1,181 +1,112 @@
-﻿/**
- * Sharing & File Saving Engine - GreenAir QC V2
- * Handles:
- * - Real PDF file saving (via showSaveFilePicker on desktop / download fallback)
- * - Real PDF file sharing (via Web Share API with actual File object)
- * - WhatsApp & Gmail integrations with automatic PDF download and descriptive assistance
- */
+/** Guardado y compartición de archivos reales: Android nativo / Web Share / navegador. */
+const toBase64 = (blob) => new Promise((resolve, reject) => {
+  const reader = new FileReader();
+  reader.onerror = () => reject(new Error('No se pudo leer el PDF'));
+  reader.onload = () => resolve(String(reader.result).split(',')[1]);
+  reader.readAsDataURL(blob);
+});
 
 export const ShareEngine = {
-  /**
-   * Prompts the user where to save the PDF (using File System Access API where available)
-   * or downloads directly to the device.
-   * @param {Blob} blob 
-   * @param {string} fileName 
-   * @returns {Promise<{success: boolean, cancelled?: boolean, method: string, message?: string}>}
-   */
+  buildSummary(meta = {}, fileName = '') {
+    const cp = meta.checkpoints || {};
+    const results = [
+      ['Presostatos', cp.presostatos],
+      ['Ventilador de impulsión', cp.ventImpulsion],
+      ['Ventilador de retorno', cp.ventRetorno],
+      ['Temperatura de impulsión', cp.tempImpulsion],
+      ['Temperatura de retorno', cp.tempRetorno]
+    ].map(([name, ok]) => `${name}: ${ok ? 'CORRECTO' : 'INCORRECTO'}`).join('\n');
+    return `*GREENAIR INDUSTRIAL — FICHA DE CONTROL Y PRUEBAS*\n` +
+      `*Nº Pedido:* ${meta.orderNumber || 'SIN PEDIDO'}\n` +
+      `*Nº Serie:* ${meta.serialNumber || 'N/A'}\n` +
+      `*Modelo:* ${meta.model || 'N/A'}\n` +
+      `*Cuadro:* ${meta.cuadro || 'N/A'}\n` +
+      `*Configuración:* ${meta.configuracion || 'N/A'}\n` +
+      `*Sonda CO2:* ${meta.optionals?.sondaCo2?.has ? (meta.optionals.sondaCo2.type || 'No especificada') : 'No instalada'}\n` +
+      `*Montador:* ${meta.personnel?.montador || 'N/A'}\n` +
+      `*Electricista:* ${meta.personnel?.electricista || 'N/A'}\n` +
+      `*Verificaciones:*\n${results}\n` +
+      `*PDF:* ${fileName}\n` +
+      `Fecha: ${new Date().toLocaleString('es-ES')}`;
+  },
+
   async savePdf(blob, fileName) {
-    // 1. Try File System Access API (Chromium Windows / Mac / Linux)
-    if (window.showSaveFilePicker) {
+    if (!(blob instanceof Blob) || !blob.size) return { success: false, message: 'PDF vacío o no válido.' };
+    if (window.GreenAirNative?.savePdf) {
+      try {
+        // El éxito real se recibe después de que Android escriba el archivo.
+        window.GreenAirNative.savePdf(await toBase64(blob), fileName);
+        return { success: false, pending: true, method: 'android_picker', message: 'Elige dónde guardar el PDF.' };
+      } catch (error) { return { success: false, message: error.message }; }
+    }
+    if (typeof window.showSaveFilePicker === 'function') {
       try {
         const handle = await window.showSaveFilePicker({
           suggestedName: fileName,
-          types: [{
-            description: 'Documento PDF (*.pdf)',
-            accept: { 'application/pdf': ['.pdf'] }
-          }]
+          types: [{ description: 'PDF', accept: { 'application/pdf': ['.pdf'] } }]
         });
-        const writable = await handle.createWritable();
-        await writable.write(blob);
-        await writable.close();
-        return {
-          success: true,
-          method: 'file_picker',
-          message: `Archivo guardado correctamente en: ${handle.name}`
-        };
-      } catch (err) {
-        if (err.name === 'AbortError') {
-          return { success: false, cancelled: true };
-        }
-        console.warn('showSaveFilePicker falló, usando método de descarga directa:', err);
+        const writer = await handle.createWritable();
+        await writer.write(blob);
+        await writer.close();
+        return { success: true, method: 'file_picker', message: 'PDF guardado correctamente.' };
+      } catch (error) {
+        if (error?.name === 'AbortError') return { success: false, cancelled: true };
+        return { success: false, message: 'Error al guardar el PDF: ' + error.message };
       }
     }
-
-    // 2. Standard Download Fallback (Android WebView / Firefox / Safari)
-    try {
-      this.downloadFile(blob, fileName);
-      return {
-        success: true,
-        method: 'download',
-        message: `Archivo descargado en tu carpeta de Descargas: ${fileName}`
-      };
-    } catch (err) {
-      console.error('Error al descargar archivo:', err);
-      return {
-        success: false,
-        method: 'failed',
-        message: 'No se pudo guardar el archivo: ' + err.message
-      };
-    }
+    this.downloadFile(blob, fileName);
+    return { success: false, pending: true, method: 'download', message: 'Descarga iniciada; verifica el archivo en Descargas.' };
   },
 
-  /**
-   * Shares the actual PDF file using the native OS share sheet (WhatsApp, Gmail, Drive, etc.)
-   * @param {Blob} blob 
-   * @param {string} fileName 
-   * @param {Object} meta 
-   * @returns {Promise<{success: boolean, cancelled?: boolean, method: string, message?: string}>}
-   */
-  async sharePdfNative(blob, fileName, meta = {}) {
+  async sharePdfNative(blob, fileName, meta = {}, preferred = '') {
+    if (!(blob instanceof Blob) || !blob.size) return { success: false, message: 'No hay PDF para compartir.' };
+    const summary = this.buildSummary(meta, fileName);
+    if (window.GreenAirNative?.sharePdf) {
+      try {
+        window.GreenAirNative.sharePdf(await toBase64(blob), fileName, summary, preferred);
+        return { success: false, pending: true, method: 'android_native', message: 'Preparando el selector nativo con PDF y texto.' };
+      } catch (error) { return { success: false, message: error.message }; }
+    }
     try {
       const file = new File([blob], fileName, { type: 'application/pdf' });
-
-      // Check if native sharing of files is supported
-      if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        await navigator.share({
-          files: [file],
-          title: `Ficha Técnica QC - Nº ${meta.serialNumber || 'SN'}`,
-          text: `Ficha de control de calidad y pruebas técnicas: ${meta.model || 'Equipo Climatizador'} (Nº Serie: ${meta.serialNumber || 'N/A'}, Cuadro: ${meta.cuadro || 'N/A'}).`
-        });
-        return { success: true, method: 'native_file_share' };
+      if (navigator.canShare?.({ files: [file] }) && navigator.share) {
+        await navigator.share({ title: `GreenAir QC — ${meta.orderNumber || meta.serialNumber || ''}`, text: summary, files: [file] });
+        return { success: true, method: 'web_share', message: 'Archivo entregado al sistema de compartición; envío no confirmado.' };
       }
-    } catch (err) {
-      if (err.name === 'AbortError') {
-        return { success: false, cancelled: true };
-      }
-      console.warn('Error en navigator.share con archivos:', err);
+    } catch (error) {
+      if (error?.name === 'AbortError') return { success: false, cancelled: true };
+      return { success: false, message: 'No se pudo compartir: ' + error.message };
     }
-
-    return {
-      success: false,
-      method: 'unsupported',
-      message: 'Tu navegador actual no admite compartir archivos directamente desde esta ventana. Se descargará el PDF para que lo adjuntes.'
-    };
+    return { success: false, unsupported: true, message: 'Este navegador no permite adjuntar PDF automáticamente.' };
   },
 
-  /**
-   * WhatsApp share with pre-download of the actual PDF and pre-filled message
-   */
-  shareWhatsApp(meta = {}, fileName = '', blob = null) {
-    if (blob) {
-      this.downloadFile(blob, fileName);
-    }
-
-    const text = 
-`*GREENAIR INDUSTRIAL - FICHA TÉCNICA DE CONTROL Y PRUEBAS*
-━━━━━━━━━━━━━━━━━━━━━━
-*Cuadro:* ${meta.cuadro || 'N/A'}
-*Configuración:* ${meta.configuracion || 'Estándar'}
-*Modelo:* ${meta.model || 'N/A'}
-*Nº de Serie:* ${meta.serialNumber || 'N/A'}
-*Fecha Fabricación:* ${meta.fabricationDate || 'N/A'}
-*Fecha Ensayo:* ${new Date().toLocaleDateString('es-ES')}
-
-*Personal Responsable:*
-- Montador: ${meta.personnel?.montador || 'N/A'}
-- Electricista: ${meta.personnel?.electricista || 'N/A'}
-
-*Estado de Inspección:* ✅ PRUEBAS CONFORMES (OK)
-${fileName ? `*Archivo PDF adjunto:* ${fileName}` : ''}
-━━━━━━━━━━━━━━━━━━━━━━`;
-
-    const encoded = encodeURIComponent(text);
-    const whatsappUrl = `https://api.whatsapp.com/send?text=${encoded}`;
-    window.open(whatsappUrl, '_blank');
+  async shareWhatsApp(meta = {}, fileName = '', blob = null) {
+    if (!blob) return { success: false, message: 'Genera antes el PDF.' };
+    const result = await this.sharePdfNative(blob, fileName, meta, 'whatsapp');
+    if (!result.unsupported) return result;
+    this.downloadFile(blob, fileName);
+    window.open(`https://api.whatsapp.com/send?text=${encodeURIComponent(this.buildSummary(meta, fileName))}`, '_blank');
+    return { success: false, pending: true, message: 'Abierto WhatsApp con el resumen. Adjunta manualmente el PDF descargado.' };
   },
 
-  /**
-   * Gmail share with pre-download of the actual PDF and pre-filled subject/body
-   */
-  shareEmail(meta = {}, fileName = '', blob = null, useGmailWeb = true) {
-    if (blob) {
-      this.downloadFile(blob, fileName);
-    }
-
-    const subject = `Ficha Técnica Pruebas - Equipo Climatizador [Nº ${meta.serialNumber || 'SN'}] - ${meta.model || ''}`;
-    const body = 
-`Estimado equipo,
-
-Adjunto la ficha técnica y reporte de pruebas de control de calidad del equipo:
-
-DATOS DEL EQUIPO:
-- Cuadro: ${meta.cuadro || 'N/A'}
-- Configuración: ${meta.configuracion || 'Estándar'}
-- Modelo: ${meta.model || 'N/A'}
-- Nº de Serie: ${meta.serialNumber || 'N/A'}
-- Fecha de Fabricación: ${meta.fabricationDate || 'N/A'}
-- Fecha y Hora de Ensayo: ${new Date().toLocaleString('es-ES')}
-
-PERSONAL ASIGNADO:
-- Montador: ${meta.personnel?.montador || 'N/A'}
-- Electricista: ${meta.personnel?.electricista || 'N/A'}
-
-ESTADO: PRUEBAS TÉCNICAS COMPLETADAS CON ÉXITO (OK)
-Archivo PDF generado: ${fileName || 'Ficha_Tecnica.pdf'}
-
-Saludos cordiales,
-Control de Calidad y Electricidad
-GreenAir Industrial`;
-
-    if (useGmailWeb) {
-      const gmailUrl = `https://mail.google.com/mail/?view=cm&fs=1&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-      window.open(gmailUrl, '_blank');
-    } else {
-      const mailtoUrl = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-      window.location.href = mailtoUrl;
-    }
+  async shareEmail(meta = {}, fileName = '', blob = null) {
+    if (!blob) return { success: false, message: 'Genera antes el PDF.' };
+    const result = await this.sharePdfNative(blob, fileName, meta);
+    if (!result.unsupported) return result;
+    this.downloadFile(blob, fileName);
+    const subject = `GreenAir QC — Pedido ${meta.orderNumber || 'SIN PEDIDO'} — Serie ${meta.serialNumber || ''}`;
+    window.open(`mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(this.buildSummary(meta, fileName))}`, '_self');
+    return { success: false, pending: true, message: 'Correo preparado. Adjunta manualmente el PDF descargado.' };
   },
 
-  /**
-   * Downloads the PDF file directly to device storage
-   */
   downloadFile(blob, fileName) {
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = fileName;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    setTimeout(() => URL.revokeObjectURL(link.href), 1500);
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = fileName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
   }
 };
